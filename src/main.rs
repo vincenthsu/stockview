@@ -4,6 +4,7 @@ mod calc;
 mod candle;
 mod compare;
 mod data;
+mod indicator;
 mod store;
 mod theme;
 

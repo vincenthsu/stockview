@@ -1,9 +1,9 @@
 //! Single-symbol candlestick workspace: volume, overlays, RSI/MACD panes, drawing tools.
 
 use crate::axis::*;
-use crate::calc;
 use crate::compare::chip;
 use crate::data::Bar;
+use crate::indicator::{Out, Style};
 use crate::store::{Drawing, Indicators};
 use crate::theme::Palette;
 use egui::{epaint::Shape, pos2, vec2, Align2, Color32, FontId, Id, Pos2, Rect, Sense, Stroke, Ui};
@@ -11,6 +11,7 @@ use egui::{epaint::Shape, pos2, vec2, Align2, Color32, FontId, Id, Pos2, Rect, S
 pub const GUTTER: f32 = 84.0;
 const AXIS_H: f32 = 26.0;
 const SUB_H: f32 = 112.0;
+const SUB_MIN: f32 = 40.0;
 pub const FIB: [f64; 7] = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,22 +111,23 @@ pub fn show(
         painter.text(rect.center(), Align2::CENTER_CENTER, "沒有可顯示的資料", FontId::proportional(14.0), pal.dim);
         return false;
     }
-    let nsub = prm.ind.rsi as usize + prm.ind.macd as usize;
+    let panes: Vec<&crate::indicator::Cfg> = prm.ind.list.iter().filter(|c| c.enabled && !c.kind.overlay()).collect();
+    let nsub = panes.len();
     let plot_l = rect.left() + 4.0;
     let plot_r = rect.right() - GUTTER;
     let bottom = rect.bottom() - AXIS_H;
-    let main = Rect::from_min_max(pos2(plot_l, rect.top() + 10.0), pos2(plot_r, bottom - nsub as f32 * SUB_H));
+    // keep at least ~40% of the height for the price pane however many panes are stacked
+    let sub_h = if nsub == 0 { SUB_H } else { ((bottom - rect.top() - 10.0) * 0.6 / nsub as f32).clamp(SUB_MIN, SUB_H) };
+    let main = Rect::from_min_max(pos2(plot_l, rect.top() + 10.0), pos2(plot_r, bottom - nsub as f32 * sub_h));
     if main.height() < 80.0 || main.width() < 80.0 {
+        painter.text(rect.center(), Align2::CENTER_CENTER, "視窗太小,或副圖指標過多 — 請關閉部分指標", FontId::proportional(13.0), pal.dim);
         return false;
     }
-    let mut subs: Vec<(&str, Rect)> = Vec::new();
+    let mut subs: Vec<Rect> = Vec::new();
     let mut y = main.bottom();
-    if prm.ind.rsi {
-        subs.push(("rsi", Rect::from_min_max(pos2(plot_l, y + 6.0), pos2(plot_r, y + SUB_H))));
-        y += SUB_H;
-    }
-    if prm.ind.macd {
-        subs.push(("macd", Rect::from_min_max(pos2(plot_l, y + 6.0), pos2(plot_r, y + SUB_H))));
+    for _ in 0..nsub {
+        subs.push(Rect::from_min_max(pos2(plot_l, y + 6.0), pos2(plot_r, y + sub_h)));
+        y += sub_h;
     }
     let all = Rect::from_min_max(main.min, pos2(plot_r, bottom));
 
@@ -182,14 +184,10 @@ pub fn show(
     }
 
     // --- indicators ---
-    let closes: Vec<f64> = bars.iter().map(|b| b.c).collect();
-    let ma = if prm.ind.ma {
-        vec![(5usize, calc::sma(&closes, 5)), (20, calc::sma(&closes, 20)), (60, calc::sma(&closes, 60))]
-    } else {
-        vec![]
-    };
-    let ema50 = if prm.ind.ema { Some(calc::ema(&closes, 50)) } else { None };
-    let bb = if prm.ind.bollinger { Some(calc::bollinger(&closes, 20, 2.0)) } else { None };
+    let overlays: Vec<(&crate::indicator::Cfg, Out)> =
+        prm.ind.list.iter().filter(|c| c.enabled && c.kind.overlay()).map(|c| (c, c.compute(bars))).collect();
+    let pane_out: Vec<Out> = panes.iter().map(|c| c.compute(bars)).collect();
+    let ind_col = |c: &crate::indicator::Cfg, slot: usize| pal.series[(c.color + slot) % 8];
 
     // --- main y range ---
     let tf = |p: f64| if prm.log { p.max(1e-9).ln() } else { p };
@@ -202,11 +200,15 @@ pub fn show(
         hi = hi.max(b.h);
         vmax = vmax.max(b.v);
     }
-    if let Some((_, u, l)) = &bb {
-        for i in i0..i1 {
-            if u[i].is_finite() {
-                hi = hi.max(u[i]);
-                lo = lo.min(l[i]);
+    for (c, o) in &overlays {
+        if c.kind.is_band() {
+            for ln in &o.lines {
+                for &v in &ln.vals[i0..i1.min(ln.vals.len())] {
+                    if v.is_finite() {
+                        hi = hi.max(v);
+                        lo = lo.min(v);
+                    }
+                }
             }
         }
     }
@@ -251,7 +253,7 @@ pub fn show(
         p.line_segment([pos2(main.left(), y), pos2(main.right(), y)], Stroke::new(1.0, pal.grid));
         price_labels.push((y, fmt_price(v)));
     }
-    for (_, r) in std::iter::once(("", main)).chain(subs.iter().map(|(k, r)| (*k, *r))) {
+    for r in std::iter::once(main).chain(subs.iter().copied()) {
         p.rect_stroke(r, 0.0, Stroke::new(1.0, pal.hair), egui::StrokeKind::Inside);
     }
     for c in [main.left_top(), main.right_top()] {
@@ -271,14 +273,6 @@ pub fn show(
         }
     }
 
-    // --- Bollinger fill lines ---
-    if let Some((mid, up, lw)) = &bb {
-        let c = pal.series[5];
-        pm.add(Shape::line(line_pts(up, i0, i1, &x_of, &y_of), Stroke::new(1.0, c)));
-        pm.add(Shape::line(line_pts(lw, i0, i1, &x_of, &y_of), Stroke::new(1.0, c)));
-        pm.add(Shape::line(line_pts(mid, i0, i1, &x_of, &y_of), Stroke::new(1.0, c.gamma_multiply(0.6))));
-    }
-
     // --- candles ---
     for col in columns(bars, i0, i1, ppb, &x_of) {
         let c = if col.c >= col.o { pal.up } else { pal.down };
@@ -291,12 +285,24 @@ pub fn show(
     }
 
     // --- overlays ---
-    let ma_cols = [pal.series[1], pal.series[0], pal.series[2]];
-    for (k, (_, v)) in ma.iter().enumerate() {
-        pm.add(Shape::line(line_pts(v, i0, i1, &x_of, &y_of), Stroke::new(1.3, ma_cols[k])));
-    }
-    if let Some(e) = &ema50 {
-        pm.add(Shape::line(line_pts(e, i0, i1, &x_of, &y_of), Stroke::new(1.3, pal.series[3])));
+    for (c, o) in &overlays {
+        for ln in &o.lines {
+            let col = ind_col(c, ln.slot);
+            let pts = line_pts(&ln.vals, i0, i1, &x_of, &y_of);
+            match ln.style {
+                Style::Solid => {
+                    pm.add(Shape::line(pts, Stroke::new(1.3, col)));
+                }
+                Style::Soft => {
+                    pm.add(Shape::line(pts, Stroke::new(1.0, col.gamma_multiply(0.6))));
+                }
+                Style::Dots => {
+                    for q in pts {
+                        pm.circle_filled(q, 1.8, col);
+                    }
+                }
+            }
+        }
     }
 
     // --- last price line ---
@@ -308,52 +314,78 @@ pub fn show(
         p.extend(Shape::dashed_line(&[pos2(main.left(), ly), pos2(main.right(), ly)], Stroke::new(1.0, last_col), 4.0, 3.0));
     }
 
+    let hover = resp.hover_pos().filter(|h| all.contains(*h));
+    let hover_idx = hover.map(|h| (((h.x - main.left()) as f64 / ppb + il - 0.5).round()).clamp(0.0, (n - 1) as f64) as usize);
+
     // --- sub panes ---
-    let mut sub_info: Vec<(&str, Rect, Box<dyn Fn(f32) -> f64>)> = Vec::new();
-    for (kind, r) in &subs {
-        match *kind {
-            "rsi" => {
-                let v = calc::rsi(&closes, 14);
-                let yr = |val: f64| r.bottom() - ((val / 100.0) as f32) * r.height();
-                for lvl in [30.0, 50.0, 70.0] {
-                    let yy = yr(lvl);
-                    p.extend(Shape::dashed_line(&[pos2(r.left(), yy), pos2(r.right(), yy)], Stroke::new(1.0, pal.grid_major), 3.0, 3.0));
-                    p.text(pos2(r.right() + 8.0, yy), Align2::LEFT_CENTER, format!("{lvl:.0}"), mono.clone(), pal.dim);
-                }
-                p.with_clip_rect(*r).add(Shape::line(line_pts(&v, i0, i1, &x_of, &yr), Stroke::new(1.4, pal.series[5])));
-                let cur = v.get(n - 1).copied().unwrap_or(f64::NAN);
-                p.text(r.min + vec2(8.0, 6.0), Align2::LEFT_TOP, format!("RSI 14   {cur:.1}"), fp(11.5), pal.series[5]);
-                let rr = *r;
-                sub_info.push(("rsi", rr, Box::new(move |y| (rr.bottom() - y) as f64 / rr.height() as f64 * 100.0)));
-            }
-            _ => {
-                let (m, s, h) = calc::macd(&closes, 12, 26, 9);
-                let mut mx = 1e-9f64;
-                for i in i0..i1 {
-                    mx = mx.max(m[i].abs()).max(s[i].abs()).max(h[i].abs());
-                }
-                let yr = |val: f64| r.center().y - (val / mx) as f32 * (r.height() * 0.44);
-                p.line_segment([pos2(r.left(), yr(0.0)), pos2(r.right(), yr(0.0))], Stroke::new(1.0, pal.grid_major));
-                let pr = p.with_clip_rect(*r);
-                let bw = (ppb * 0.6).max(1.0) as f32;
-                for i in i0..i1 {
-                    let x = x_of(i as f64);
-                    let c = if h[i] >= 0.0 { pal.up } else { pal.down }.gamma_multiply(0.6);
-                    pr.rect_filled(Rect::from_x_y_ranges(x - bw / 2.0..=x + bw / 2.0, yr(h[i]).min(yr(0.0))..=yr(h[i]).max(yr(0.0))), 0.0, c);
-                }
-                pr.add(Shape::line(line_pts(&m, i0, i1, &x_of, &yr), Stroke::new(1.3, pal.series[0])));
-                pr.add(Shape::line(line_pts(&s, i0, i1, &x_of, &yr), Stroke::new(1.3, pal.series[1])));
-                p.text(
-                    r.min + vec2(8.0, 6.0),
-                    Align2::LEFT_TOP,
-                    format!("MACD 12,26,9   {:.2}  {:.2}  {:.2}", m[n - 1], s[n - 1], h[n - 1]),
-                    fp(11.5),
-                    pal.series[0],
-                );
-                let rr = *r;
-                sub_info.push(("macd", rr, Box::new(move |y| (rr.center().y - y) as f64 / (rr.height() * 0.44) as f64 * mx)));
+    let at = hover_idx.unwrap_or(n - 1);
+    let mut sub_info: Vec<(Rect, Box<dyn Fn(f32) -> f64>)> = Vec::new();
+    for ((cfg, o), r) in panes.iter().zip(&pane_out).zip(&subs) {
+        let r = *r;
+        let (lo, hi) = pane_range(o, i0, i1);
+        let yr = move |val: f64| r.bottom() - 3.0 - ((val - lo) / (hi - lo)) as f32 * (r.height() - 6.0);
+        let pc = p.with_clip_rect(r);
+        if lo < 0.0 && hi > 0.0 && !o.levels.contains(&0.0) {
+            p.line_segment([pos2(r.left(), yr(0.0)), pos2(r.right(), yr(0.0))], Stroke::new(1.0, pal.grid_major));
+        }
+        let mut last_lbl = f32::MIN;
+        for &lvl in o.levels {
+            let yy = yr(lvl);
+            p.extend(Shape::dashed_line(&[pos2(r.left(), yy), pos2(r.right(), yy)], Stroke::new(1.0, pal.grid_major), 3.0, 3.0));
+            if (yy - last_lbl).abs() >= 13.0 {
+                p.text(pos2(r.right() + 8.0, yy), Align2::LEFT_CENTER, fmt_ind(lvl), mono.clone(), pal.dim);
+                last_lbl = yy;
             }
         }
+        if o.levels.is_empty() {
+            for t in nice_ticks(lo, hi, 3) {
+                let yy = yr(t);
+                if t > lo && t < hi && (yy - last_lbl).abs() >= 13.0 {
+                    p.text(pos2(r.right() + 8.0, yy), Align2::LEFT_CENTER, fmt_ind(t), mono.clone(), pal.dim);
+                    last_lbl = yy;
+                }
+            }
+        }
+        if let Some(hs) = &o.hist {
+            let bw = (ppb * 0.6).max(1.0) as f32;
+            for i in i0..i1 {
+                if !hs[i].is_finite() {
+                    continue;
+                }
+                let x = x_of(i as f64);
+                let c = if hs[i] >= 0.0 { pal.up } else { pal.down }.gamma_multiply(0.6);
+                let (y0, y1) = (yr(hs[i]), yr(0.0));
+                pc.rect_filled(Rect::from_x_y_ranges(x - bw / 2.0..=x + bw / 2.0, y0.min(y1)..=y0.max(y1)), 0.0, c);
+            }
+        }
+        let mut head = vec![(cfg.title(), pal.dim)];
+        for ln in &o.lines {
+            let col = ind_col(cfg, ln.slot);
+            let pts = line_pts(&ln.vals, i0, i1, &x_of, &yr);
+            match ln.style {
+                Style::Dots => {
+                    for q in pts {
+                        pc.circle_filled(q, 1.8, col);
+                    }
+                }
+                _ => {
+                    pc.add(Shape::line(pts, Stroke::new(1.4, col)));
+                }
+            }
+            let val = ln.vals.get(at).copied().unwrap_or(f64::NAN);
+            head.push((if ln.name.is_empty() { fmt_ind(val) } else { format!("{} {}", ln.name, fmt_ind(val)) }, col));
+        }
+        if let Some(hs) = &o.hist {
+            head.push((format!("柱 {}", fmt_ind(hs.get(at).copied().unwrap_or(f64::NAN))), pal.dim));
+        }
+        let mut hx = r.left() + 8.0;
+        for (txt, col) in head {
+            let g = p.layout_no_wrap(txt, fp(11.5), col);
+            let w = g.size().x;
+            p.galley(pos2(hx, r.top() + 4.0), g, col);
+            hx += w + 12.0;
+        }
+        sub_info.push((r, Box::new(move |y| lo + ((r.bottom() - 3.0 - y) / (r.height() - 6.0)) as f64 * (hi - lo))));
     }
 
     // --- drawings ---
@@ -422,8 +454,6 @@ pub fn show(
     }
 
     // --- hover / tools ---
-    let hover = resp.hover_pos().filter(|h| all.contains(*h));
-    let hover_idx = hover.map(|h| (((h.x - main.left()) as f64 / ppb + il - 0.5).round()).clamp(0.0, (n - 1) as f64) as usize);
     if let Some(h) = hover {
         let dash = Stroke::new(1.0, pal.dim);
         let x = hover_idx.map(|i| x_of(i as f64)).unwrap_or(h.x);
@@ -432,8 +462,8 @@ pub fn show(
         let yr = Rect::from_center_size(pos2(main.right() + GUTTER / 2.0 - 4.0, h.y), vec2(GUTTER - 10.0, 18.0));
         if main.contains(h) {
             chip(&p, yr, pal.ink, &fmt_price(price_at(h.y)), pal.on_ink, mono.clone());
-        } else if let Some((_, _, f)) = sub_info.iter().find(|(_, r, _)| r.contains(h)) {
-            chip(&p, yr, pal.ink, &format!("{:.2}", f(h.y)), pal.on_ink, mono.clone());
+        } else if let Some((_, f)) = sub_info.iter().find(|(r, _)| r.contains(h)) {
+            chip(&p, yr, pal.ink, &fmt_ind(f(h.y)), pal.on_ink, mono.clone());
         }
         if let Some(i) = hover_idx {
             let xr = Rect::from_center_size(pos2(x, bottom + 14.0), vec2(82.0, 18.0));
@@ -540,20 +570,11 @@ pub fn show(
         p.galley(pos2(lx, ly2), g, c);
         lx += w + 14.0;
     };
-    let at = hover_idx.unwrap_or(n - 1);
-    for (k, (per, v)) in ma.iter().enumerate() {
-        if v[at].is_finite() {
-            put(format!("MA{per} {}", fmt_price(v[at])), ma_cols[k]);
-        }
-    }
-    if let Some(e) = &ema50 {
-        if e[at].is_finite() {
-            put(format!("EMA50 {}", fmt_price(e[at])), pal.series[3]);
-        }
-    }
-    if let Some((_, u, l)) = &bb {
-        if u[at].is_finite() {
-            put(format!("BB20 {} / {}", fmt_price(u[at]), fmt_price(l[at])), pal.series[5]);
+    for (c, o) in &overlays {
+        let vals: Vec<String> =
+            o.lines.iter().filter_map(|l| l.vals.get(at).copied().filter(|v| v.is_finite())).map(fmt_price).collect();
+        if !vals.is_empty() {
+            put(format!("{} {}", c.title(), vals.join(" / ")), ind_col(c, 0));
         }
     }
     if prm.ind.volume {
@@ -570,6 +591,51 @@ pub fn show(
         );
     }
     new_tool_done
+}
+
+/// Value range of a sub pane over the visible bars, padded; fixed-scale indicators keep their natural bounds.
+fn pane_range(o: &Out, i0: usize, i1: usize) -> (f64, f64) {
+    if let Some(r) = o.fixed {
+        return r;
+    }
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    let mut see = |v: f64| {
+        if v.is_finite() {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    };
+    for ln in &o.lines {
+        for &v in &ln.vals[i0.min(ln.vals.len())..i1.min(ln.vals.len())] {
+            see(v);
+        }
+    }
+    if let Some(h) = &o.hist {
+        for &v in &h[i0.min(h.len())..i1.min(h.len())] {
+            see(v);
+        }
+        see(0.0);
+    }
+    for &l in o.levels {
+        see(l);
+    }
+    if lo > hi {
+        return (0.0, 1.0);
+    }
+    let pad = ((hi - lo) * 0.08).max(1e-9);
+    (lo - pad, hi + pad)
+}
+
+fn fmt_ind(v: f64) -> String {
+    if !v.is_finite() {
+        "—".into()
+    } else if v.abs() >= 1e5 {
+        fmt_vol(v)
+    } else if v.abs() >= 100.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
 }
 
 struct Col {

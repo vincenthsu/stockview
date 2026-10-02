@@ -48,6 +48,8 @@ pub struct App {
     dirty: bool,
     shot_at: Option<u64>,
     last_save: Instant,
+    notice: Option<(String, bool, Instant)>,
+    confirm_del: Option<usize>,
 }
 
 const MAX_COMPARE: usize = 8;
@@ -117,26 +119,94 @@ impl App {
             dirty: false,
             shot_at: None,
             last_save: Instant::now(),
+            notice: None,
+            confirm_del: None,
         };
-        // make sure no two compared series share an ink (older saved states could)
-        let mut seen = HashSet::new();
-        for sym in app.st.compare.clone() {
-            if let Some(i) = app.st.colors.get(&sym) {
-                if !seen.insert(*i) {
-                    app.st.colors.remove(&sym);
-                }
-            }
-        }
-        for sym in app.st.compare.clone() {
-            app.color_of(&sym);
-        }
+        app.fix_colors();
         let mut want: Vec<String> = app.st.compare.clone();
         want.push(app.st.selected.clone());
-        want.extend(app.st.watchlist.clone());
+        want.extend(app.st.watch().clone());
         for s in want {
             app.request(&cc.egui_ctx, &s);
         }
         app
+    }
+
+    /// Make sure no two compared series share an ink (older or imported states could).
+    fn fix_colors(&mut self) {
+        let mut seen = HashSet::new();
+        for sym in self.st.compare.clone() {
+            if let Some(i) = self.st.colors.get(&sym) {
+                if !seen.insert(*i) {
+                    self.st.colors.remove(&sym);
+                }
+            }
+        }
+        for sym in self.st.compare.clone() {
+            self.color_of(&sym);
+        }
+    }
+
+    fn request_group(&mut self, ctx: &egui::Context) {
+        for s in self.st.watch().clone() {
+            self.request(ctx, &s);
+        }
+    }
+
+    fn notify(&mut self, msg: impl Into<String>, ok: bool) {
+        self.notice = Some((msg.into(), ok, Instant::now()));
+    }
+
+    fn export_settings(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("匯出 StockView 設定")
+            .set_file_name("stockview-settings.json")
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, self.st.export_json()) {
+            Ok(()) => {
+                let n: usize = self.st.groups.iter().map(|g| g.symbols.len()).sum();
+                self.notify(format!("已匯出 {} 組自選({} 檔)與全部設定", self.st.groups.len(), n), true);
+            }
+            Err(e) => self.notify(format!("匯出失敗:{e}"), false),
+        }
+    }
+
+    fn import_settings(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new().set_title("匯入 StockView 設定").add_filter("JSON", &["json"]).pick_file() else {
+            return;
+        };
+        self.import_path(ctx, &path);
+    }
+
+    fn import_path(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        let res = std::fs::read_to_string(path).map_err(|e| format!("讀取失敗:{e}")).and_then(|t| Persisted::import_json(&t));
+        match res {
+            Ok(st) => {
+                let n: usize = st.groups.iter().map(|g| g.symbols.len()).sum();
+                let msg = format!("已匯入 {} 組自選({} 檔)、{} 個指標設定", st.groups.len(), n, st.indicators.list.len());
+                self.st = st;
+                self.apply_theme(ctx);
+                self.fix_colors();
+                self.bars_cache = None;
+                self.ts = ToolState::default();
+                self.fit_pending = true;
+                self.cdl_fit_pending = true;
+                self.confirm_del = None;
+                let mut want = self.st.compare.clone();
+                want.push(self.st.selected.clone());
+                for s in want {
+                    self.request(ctx, &s);
+                }
+                self.request_group(ctx);
+                self.st.save();
+                self.notify(msg, true);
+            }
+            Err(e) => self.notify(format!("匯入失敗:{e}"), false),
+        }
     }
 
     fn request(&mut self, ctx: &egui::Context, sym: &str) {
@@ -266,7 +336,9 @@ impl App {
     }
 
     fn rename_symbol(&mut self, from: &str, to: &str) {
-        for v in [&mut self.st.watchlist, &mut self.st.compare] {
+        let mut lists: Vec<&mut Vec<String>> = self.st.groups.iter_mut().map(|g| &mut g.symbols).collect();
+        lists.push(&mut self.st.compare);
+        for v in lists {
             for s in v.iter_mut() {
                 if s == from {
                     *s = to.to_string();
@@ -288,8 +360,8 @@ impl App {
         if !h.name.is_empty() {
             self.st.names.insert(sym.clone(), h.name.clone());
         }
-        if !self.st.watchlist.contains(&sym) {
-            self.st.watchlist.push(sym.clone());
+        if !self.st.watch().contains(&sym) {
+            self.st.watch_mut().push(sym.clone());
         }
         match self.st.mode {
             Mode::Compare => self.add_compare(&sym),
@@ -435,9 +507,17 @@ impl App {
             match std::env::var("STOCKVIEW_MODE").as_deref() {
                 Ok("chart") => {
                     self.st.mode = Mode::Chart;
-                    self.st.indicators.bollinger = true;
-                    self.st.indicators.rsi = true;
-                    self.st.indicators.macd = true;
+                    use crate::indicator::{Cfg, Kind};
+                    if std::env::var("STOCKVIEW_IND").as_deref() == Ok("all") {
+                        let kinds = Kind::OVERLAYS.iter().chain(Kind::PANES.iter());
+                        self.st.indicators.list = kinds.enumerate().map(|(i, k)| Cfg::new(*k, i)).collect();
+                    } else {
+                        for c in &mut self.st.indicators.list {
+                            if matches!(c.kind, Kind::Boll | Kind::Rsi | Kind::Macd | Kind::Kd) {
+                                c.enabled = true;
+                            }
+                        }
+                    }
                     self.st.range = Range::Y3;
                     self.cdl_fit_pending = true;
                 }
@@ -557,6 +637,7 @@ impl App {
                     self.st.total_return = !self.st.total_return;
                     self.dirty = true;
                 }
+                self.settings_menu(ui);
             });
         });
         ui.add_space(6.0);
@@ -655,20 +736,214 @@ impl App {
     }
 
     fn indicator_menu(&mut self, ui: &mut Ui) {
+        use crate::indicator::{self, Cfg, Kind};
         let mut changed = false;
+        let pal = self.pal.clone();
+        let active = self.st.indicators.list.iter().any(|c| c.enabled);
+        let resp = chip_btn(ui, &pal, "指標", active);
         let ind = &mut self.st.indicators;
-        let active = ind.ma || ind.ema || ind.bollinger || ind.rsi || ind.macd;
-        let resp = chip_btn(ui, &self.pal, "指標", active);
-        egui::Popup::menu(&resp).show(|ui| {
-            ui.set_min_width(170.0);
+        egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_min_width(380.0);
             changed |= ui.checkbox(&mut ind.volume, "成交量").changed();
-            changed |= ui.checkbox(&mut ind.ma, "移動平均 MA 5 / 20 / 60").changed();
-            changed |= ui.checkbox(&mut ind.ema, "指數移動平均 EMA 50").changed();
-            changed |= ui.checkbox(&mut ind.bollinger, "布林通道 (20, 2)").changed();
-            changed |= ui.checkbox(&mut ind.rsi, "RSI (14)").changed();
-            changed |= ui.checkbox(&mut ind.macd, "MACD (12, 26, 9)").changed();
+            ui.separator();
+            let mut del: Option<usize> = None;
+            egui::ScrollArea::vertical().max_height(300.0).auto_shrink([true, true]).show(ui, |ui| {
+                for (i, c) in ind.list.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        changed |= ui.checkbox(&mut c.enabled, "").changed();
+                        let (r, rs) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
+                        ui.painter().rect_filled(r, 2.0, pal.series[c.color % 8]);
+                        if rs.on_hover_text("點擊換色").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            c.color = (c.color + 1) % 8;
+                            changed = true;
+                        }
+                        ui.label(egui::RichText::new(c.kind.short()).strong()).on_hover_text(c.kind.label());
+                        for (k, spec) in c.kind.params().iter().enumerate() {
+                            if k >= c.params.len() {
+                                break;
+                            }
+                            ui.label(egui::RichText::new(spec.name).size(11.5).color(pal.dim));
+                            let mut v = c.params[k];
+                            let dv = egui::DragValue::new(&mut v)
+                                .range(spec.min..=spec.max)
+                                .speed(if spec.int { 0.15 } else { 0.01 })
+                                .max_decimals(if spec.int { 0 } else { 3 });
+                            if ui.add(dv).changed() {
+                                c.params[k] = if spec.int { v.round() } else { v };
+                                changed = true;
+                            }
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("×").on_hover_text("移除").clicked() {
+                                del = Some(i);
+                            }
+                        });
+                    });
+                }
+                if ind.list.is_empty() {
+                    ui.colored_label(pal.dim, "尚無指標 — 從下方新增");
+                }
+            });
+            if let Some(i) = del {
+                ind.list.remove(i);
+                changed = true;
+            }
+            ui.separator();
+            let mut add: Option<Kind> = None;
+            for (title, kinds) in [("新增主圖", &Kind::OVERLAYS[..]), ("新增副圖", &Kind::PANES[..])] {
+                ui.label(egui::RichText::new(title).size(11.5).color(pal.dim));
+                ui.horizontal_wrapped(|ui| {
+                    for k in kinds {
+                        if ui.button(k.short()).on_hover_text(k.label()).clicked() {
+                            add = Some(*k);
+                        }
+                    }
+                });
+            }
+            if let Some(k) = add {
+                let color = ind.list.len() % 8;
+                ind.list.push(Cfg::new(k, color));
+                changed = true;
+            }
+            ui.add_space(2.0);
+            if ui.button("還原預設").clicked() {
+                *ind = Default::default();
+                changed = true;
+            }
+            let _ = indicator::defaults;
         });
         if changed {
+            self.dirty = true;
+        }
+    }
+
+    fn settings_menu(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let resp = chip_btn(ui, &self.pal, "設定檔", false).on_hover_text("匯入 / 匯出全部設定");
+        let (mut exp, mut imp) = (false, false);
+        let dim = self.pal.dim;
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.set_min_width(210.0);
+            if ui.button("匯出全部設定…").clicked() {
+                exp = true;
+            }
+            if ui.button("匯入設定…").clicked() {
+                imp = true;
+            }
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("含所有自選群組、指標參數、繪圖與外觀。\n也可把 .json 檔直接拖進視窗匯入。").size(11.0).color(dim));
+        });
+        if exp {
+            self.export_settings();
+        }
+        if imp {
+            self.import_settings(&ctx);
+        }
+    }
+
+    fn group_bar(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let pal = self.pal.clone();
+        let mut switch: Option<usize> = None;
+        let mut delete: Option<usize> = None;
+        let mut new_group: Option<Vec<String>> = None;
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let name = {
+                let n = &self.st.groups[self.st.active_group].name;
+                if n.chars().count() > 10 { n.chars().take(9).collect::<String>() + "…" } else { n.clone() }
+            };
+            let resp = chip_btn(ui, &pal, &format!("群組:{name}"), false).on_hover_text("切換 / 管理自選群組");
+            ui.label(egui::RichText::new(format!("{} 檔 · 共 {} 組", self.st.watch().len(), self.st.groups.len())).size(11.5).color(pal.dim));
+            egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(240.0);
+                ui.label(egui::RichText::new("目前群組名稱").size(11.5).color(pal.dim));
+                let a = self.st.active_group;
+                if ui.add(egui::TextEdit::singleline(&mut self.st.groups[a].name).desired_width(f32::INFINITY)).changed() {
+                    self.dirty = true;
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(240.0).auto_shrink([true, true]).show(ui, |ui| {
+                    let many = self.st.groups.len() > 1;
+                    for (i, g) in self.st.groups.iter().enumerate() {
+                        let (r, rs) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                        let cur = i == self.st.active_group;
+                        if cur {
+                            ui.painter().rect_filled(r, 2.0, pal.grid_major);
+                        } else if rs.hovered() {
+                            ui.painter().rect_filled(r, 2.0, pal.grid);
+                        }
+                        let mut nm = g.name.clone();
+                        if nm.chars().count() > 14 {
+                            nm = nm.chars().take(13).collect::<String>() + "…";
+                        }
+                        ui.painter().text(r.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, nm, FontId::proportional(13.0), pal.ink);
+                        let xr = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(22.0, 20.0));
+                        let confirm = self.confirm_del == Some(i);
+                        let hx = many && ui.rect_contains_pointer(xr);
+                        let (label, col) = if confirm { ("確定刪除?", pal.baseline) } else { ("×", if hx { pal.baseline } else { pal.dim }) };
+                        let xr = if confirm { Rect::from_center_size(xr.center(), vec2(70.0, 20.0)).translate(vec2(-24.0, 0.0)) } else { xr };
+                        if many {
+                            ui.painter().text(xr.center(), Align2::CENTER_CENTER, label, FontId::proportional(11.5), col);
+                        }
+                        ui.painter().text(
+                            pos2(if many { xr.left() - 6.0 } else { r.right() - 8.0 }, r.center().y),
+                            Align2::RIGHT_CENTER,
+                            g.symbols.len().to_string(),
+                            FontId::monospace(11.5),
+                            pal.dim,
+                        );
+                        if rs.clicked() {
+                            if many && ui.rect_contains_pointer(xr) {
+                                if confirm {
+                                    delete = Some(i);
+                                } else {
+                                    self.confirm_del = Some(i);
+                                }
+                            } else {
+                                switch = Some(i);
+                            }
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("＋ 新增群組").clicked() {
+                        new_group = Some(Vec::new());
+                    }
+                    if ui.button("複製目前").clicked() {
+                        new_group = Some(self.st.watch().clone());
+                    }
+                    if ui.button("由比較清單建立").clicked() {
+                        new_group = Some(self.st.compare.clone());
+                    }
+                });
+            });
+        });
+        if let Some(i) = switch {
+            self.st.active_group = i;
+            self.confirm_del = None;
+            self.request_group(&ctx);
+            self.dirty = true;
+        }
+        if let Some(i) = delete {
+            self.st.groups.remove(i);
+            if i < self.st.active_group || self.st.active_group >= self.st.groups.len() {
+                self.st.active_group = self.st.active_group.saturating_sub(1);
+            }
+            self.confirm_del = None;
+            self.request_group(&ctx);
+            self.dirty = true;
+        }
+        if let Some(symbols) = new_group {
+            let mut n = self.st.groups.len() + 1;
+            while self.st.groups.iter().any(|g| g.name == format!("群組 {n}")) {
+                n += 1;
+            }
+            self.st.groups.push(Group { name: format!("群組 {n}"), symbols });
+            self.st.active_group = self.st.groups.len() - 1;
+            self.confirm_del = None;
+            self.request_group(&ctx);
             self.dirty = true;
         }
     }
@@ -805,17 +1080,14 @@ impl App {
     fn watchlist(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new(format!("自選清單  {}", self.st.watchlist.len())).size(12.5).color(self.pal.dim));
-        });
-        ui.add_space(4.0);
+        self.group_bar(ui);
+        ui.add_space(6.0);
         let mut toggle: Option<String> = None;
         let mut open: Option<String> = None;
         let mut remove: Option<String> = None;
         let mut rects: Vec<Rect> = Vec::new();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for sym in self.st.watchlist.clone() {
+            for sym in self.st.watch().clone() {
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click_and_drag());
                 rects.push(r);
                 if resp.drag_started() {
@@ -885,7 +1157,7 @@ impl App {
                         toggle = Some(sym.clone());
                         ui.close();
                     }
-                    if ui.button("從自選移除").clicked() {
+                    if ui.button("從此群組移除").clicked() {
                         remove = Some(sym.clone());
                         ui.close();
                     }
@@ -903,10 +1175,11 @@ impl App {
                 ui.painter().line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(2.5, self.pal.baseline));
             }
             if ctx.input(|i| i.pointer.any_released()) {
-                if let (Some(t), Some(from)) = (target, self.st.watchlist.iter().position(|x| *x == src)) {
-                    let item = self.st.watchlist.remove(from);
+                if let (Some(t), Some(from)) = (target, self.st.watch().iter().position(|x| *x == src)) {
+                    let item = self.st.watch_mut().remove(from);
                     let t = if t > from { t - 1 } else { t };
-                    self.st.watchlist.insert(t.min(self.st.watchlist.len()), item);
+                    let len = self.st.watch().len();
+                    self.st.watch_mut().insert(t.min(len), item);
                     self.dirty = true;
                 }
                 self.drag_src = None;
@@ -939,8 +1212,10 @@ impl App {
             self.dirty = true;
         }
         if let Some(s) = remove {
-            self.st.watchlist.retain(|x| *x != s);
-            self.st.compare.retain(|x| *x != s);
+            self.st.watch_mut().retain(|x| *x != s);
+            if !self.st.in_any_group(&s) {
+                self.st.compare.retain(|x| *x != s);
+            }
             self.dirty = true;
         }
     }
@@ -1212,6 +1487,10 @@ impl eframe::App for App {
                 self.dirty = true;
             }
         }
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        if let Some(p) = dropped.iter().find(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("json"))) {
+            self.import_path(ctx, p);
+        }
         let pal = self.pal.clone();
         let bar = |fill: Color32| egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, pal.hair));
         egui::Panel::top("top").frame(bar(pal.panel)).show(root, |ui| self.top_bar(ui));
@@ -1238,6 +1517,19 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(pal.ground))
             .show(root, |ui| self.central(ui));
 
+        if let Some((msg, ok, at)) = &self.notice {
+            if at.elapsed() < Duration::from_secs(5) {
+                let col = if *ok { pal.ink } else { pal.baseline };
+                egui::Area::new(Id::new("notice")).order(egui::Order::Tooltip).anchor(Align2::CENTER_BOTTOM, vec2(0.0, -18.0)).show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(egui::RichText::new(msg).color(col));
+                    });
+                });
+                ctx.request_repaint_after(Duration::from_millis(500));
+            } else {
+                self.notice = None;
+            }
+        }
         if self.dirty && self.last_save.elapsed() > Duration::from_millis(800) {
             self.st.save();
             self.dirty = false;
