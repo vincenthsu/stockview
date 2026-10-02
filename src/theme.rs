@@ -99,7 +99,6 @@ impl Palette {
         v.window_fill = self.panel;
         v.extreme_bg_color = self.ground;
         v.faint_bg_color = self.panel;
-        v.override_text_color = Some(self.ink);
         v.window_stroke = Stroke::new(1.0, self.hair);
         v.selection.bg_fill = self.ink;
         v.selection.stroke = Stroke::new(1.0, self.on_ink);
@@ -124,6 +123,10 @@ impl Palette {
         v.widgets.hovered.weak_bg_fill = self.grid_major;
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, self.ink);
         v.widgets.hovered.fg_stroke = Stroke::new(1.0, self.ink);
+        v.widgets.open.bg_fill = self.panel;
+        v.widgets.open.weak_bg_fill = self.panel;
+        v.widgets.open.fg_stroke = Stroke::new(1.0, self.ink);
+        v.widgets.open.bg_stroke = Stroke::new(1.0, self.ink);
         v.widgets.active.bg_fill = self.ink;
         v.widgets.active.weak_bg_fill = self.ink;
         v.widgets.active.fg_stroke = Stroke::new(1.0, self.on_ink);

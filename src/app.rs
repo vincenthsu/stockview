@@ -50,6 +50,7 @@ pub struct App {
     last_save: Instant,
     notice: Option<(String, bool, Instant)>,
     confirm_del: Option<usize>,
+    no_save: bool,
 }
 
 const MAX_COMPARE: usize = 8;
@@ -121,6 +122,7 @@ impl App {
             last_save: Instant::now(),
             notice: None,
             confirm_del: None,
+            no_save: std::env::var("STOCKVIEW_SHOT").is_ok(),
         };
         app.fix_colors();
         let mut want: Vec<String> = app.st.compare.clone();
@@ -202,7 +204,9 @@ impl App {
                     self.request(ctx, &s);
                 }
                 self.request_group(ctx);
-                self.st.save();
+                if !self.no_save {
+                    self.st.save();
+                }
                 self.notify(msg, true);
             }
             Err(e) => self.notify(format!("匯入失敗:{e}"), false),
@@ -741,9 +745,13 @@ impl App {
         let pal = self.pal.clone();
         let active = self.st.indicators.list.iter().any(|c| c.enabled);
         let resp = chip_btn(ui, &pal, "指標", active);
+        if self.no_save && std::env::var("STOCKVIEW_POPUP").is_ok() {
+            egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&resp));
+        }
         let ind = &mut self.st.indicators;
         egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             ui.set_min_width(380.0);
+            ui.set_max_width(430.0);
             changed |= ui.checkbox(&mut ind.volume, "成交量").changed();
             ui.separator();
             let mut del: Option<usize> = None;
@@ -757,7 +765,7 @@ impl App {
                             c.color = (c.color + 1) % 8;
                             changed = true;
                         }
-                        ui.label(egui::RichText::new(c.kind.short()).strong()).on_hover_text(c.kind.label());
+                        ui.label(egui::RichText::new(c.kind.short()).color(pal.ink).size(13.0)).on_hover_text(c.kind.label());
                         for (k, spec) in c.kind.params().iter().enumerate() {
                             if k >= c.params.len() {
                                 break;
@@ -1530,7 +1538,9 @@ impl eframe::App for App {
                 self.notice = None;
             }
         }
-        if self.dirty && self.last_save.elapsed() > Duration::from_millis(800) {
+        if self.no_save {
+            self.dirty = false;
+        } else if self.dirty && self.last_save.elapsed() > Duration::from_millis(800) {
             self.st.save();
             self.dirty = false;
             self.last_save = Instant::now();
@@ -1540,7 +1550,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
-        self.st.save();
+        if !self.no_save {
+            self.st.save();
+        }
     }
 }
 
