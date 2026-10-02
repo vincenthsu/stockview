@@ -156,6 +156,25 @@ pub fn fetch_series(symbol: &str) -> Result<Series, String> {
     Ok(s)
 }
 
+/// Latest price snapshot (cheap: one tiny request).
+pub fn fetch_quote(symbol: &str) -> Result<crate::alert::Quote, String> {
+    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?range=1d&interval=1d", urlenc(symbol));
+    let mut resp = agent().get(&url).call().map_err(|e| match e {
+        ureq::Error::StatusCode(429) => "請求過於頻繁(429)".to_string(),
+        other => format!("連線失敗:{other}"),
+    })?;
+    let body: serde_json::Value = resp.body_mut().read_json().map_err(|e| format!("資料解析失敗:{e}"))?;
+    let meta = &body["chart"]["result"][0]["meta"];
+    let price = num(&meta["regularMarketPrice"]).ok_or_else(|| format!("{symbol} 沒有報價"))?;
+    Ok(crate::alert::Quote {
+        price,
+        high: num(&meta["regularMarketDayHigh"]).unwrap_or(price),
+        low: num(&meta["regularMarketDayLow"]).unwrap_or(price),
+        volume: num(&meta["regularMarketVolume"]).unwrap_or(0.0),
+        t: meta["regularMarketTime"].as_i64().unwrap_or_else(now_secs),
+    })
+}
+
 pub fn search(query: &str) -> Result<Vec<SearchHit>, String> {
     let url = format!(
         "https://query2.finance.yahoo.com/v1/finance/search?q={}&quotesCount=10&newsCount=0&lang=zh-Hant-TW&region=TW",

@@ -50,6 +50,9 @@ macro_rules! pf {
     };
 }
 
+pub(crate) use pf;
+pub(crate) use pi;
+
 impl Kind {
     pub const OVERLAYS: [Kind; 10] = [
         Kind::Sma,

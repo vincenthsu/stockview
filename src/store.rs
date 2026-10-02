@@ -1,6 +1,7 @@
 //! Persisted user state: watchlist, compare set, view options, drawings.
 
 use serde::{Deserialize, Serialize};
+use crate::alert::{Alert, AlertEvent};
 use crate::indicator::{self, Cfg};
 use std::collections::HashMap;
 
@@ -118,6 +119,8 @@ pub struct Persisted {
     pub drawings: HashMap<String, Vec<Drawing>>,
     pub colors: HashMap<String, usize>,
     pub names: HashMap<String, String>,
+    pub alerts: Vec<Alert>,
+    pub alert_log: Vec<AlertEvent>,
 }
 
 impl Default for Persisted {
@@ -148,6 +151,8 @@ impl Default for Persisted {
             drawings: HashMap::new(),
             colors: HashMap::new(),
             names: HashMap::new(),
+            alerts: Vec::new(),
+            alert_log: Vec::new(),
         }
     }
 }
@@ -190,6 +195,21 @@ impl Persisted {
         }
         for c in &mut self.indicators.list {
             c.sanitize();
+        }
+        for a in &mut self.alerts {
+            a.cond.sanitize();
+        }
+        let max_id = self.alerts.iter().map(|a| a.id).max().unwrap_or(0);
+        let mut seen = std::collections::HashSet::new();
+        for a in &mut self.alerts {
+            if a.id == 0 || !seen.insert(a.id) {
+                a.id = max_id + 1 + seen.len() as u64;
+                seen.insert(a.id);
+            }
+        }
+        let n = self.alert_log.len();
+        if n > 500 {
+            self.alert_log.drain(..n - 500);
         }
     }
 

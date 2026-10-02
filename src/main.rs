@@ -1,3 +1,4 @@
+mod alert;
 mod app;
 mod axis;
 mod calc;
@@ -5,6 +6,7 @@ mod candle;
 mod compare;
 mod data;
 mod indicator;
+mod mail;
 mod store;
 mod theme;
 

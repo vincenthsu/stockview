@@ -1,10 +1,12 @@
 //! Application shell: toolbar, watchlist, stats table, mode switching, background fetches.
 
+use crate::alert::{self, Alert, AlertEvent, Cond, CondKind, Quote, Repeat};
 use crate::axis::*;
 use crate::calc::{self, Resample, DAY};
 use crate::candle::{self, Tool, ToolState};
 use crate::compare::{self, Line};
 use crate::data::{self, Bar, SearchHit, Series};
+use crate::mail::{self, SmtpCfg};
 use crate::store::*;
 use crate::theme::Palette;
 use egui::{pos2, vec2, Align, Align2, Color32, FontId, Id, Layout, Rect, Response, Sense, Stroke, Ui};
@@ -16,7 +18,35 @@ use std::time::{Duration, Instant};
 enum Msg {
     Series(String, Result<Series, String>),
     Hits(String, Result<Vec<SearchHit>, String>),
+    Quote(String, Result<Quote, String>),
+    Mail(String, Result<(), String>),
 }
+
+struct Toast {
+    title: String,
+    body: String,
+    at: Instant,
+}
+
+struct AlertForm {
+    sym: String,
+    kind: CondKind,
+    up: bool,
+    params: Vec<f64>,
+    repeat: Repeat,
+    toast: bool,
+    system: bool,
+    email: bool,
+    chart: bool,
+}
+
+impl Default for AlertForm {
+    fn default() -> Self {
+        Self { sym: String::new(), kind: CondKind::Price, up: true, params: vec![], repeat: Repeat::Once, toast: true, system: false, email: false, chart: true }
+    }
+}
+
+type MarkSet = (Vec<candle::Mark>, Vec<candle::Level>);
 
 pub struct App {
     st: Persisted,
@@ -51,6 +81,17 @@ pub struct App {
     notice: Option<(String, bool, Instant)>,
     confirm_del: Option<usize>,
     no_save: bool,
+    alerts_open: bool,
+    alert_tab: usize,
+    form: AlertForm,
+    live: HashMap<String, Quote>,
+    quoting: HashSet<String>,
+    armed: HashMap<u64, bool>,
+    last_quote_poll: Instant,
+    force_quote: bool,
+    toasts: Vec<Toast>,
+    smtp: SmtpCfg,
+    mark_cache: Option<(String, Arc<MarkSet>)>,
 }
 
 const MAX_COMPARE: usize = 8;
@@ -123,6 +164,17 @@ impl App {
             notice: None,
             confirm_del: None,
             no_save: std::env::var("STOCKVIEW_SHOT").is_ok(),
+            alerts_open: false,
+            alert_tab: 0,
+            form: AlertForm::default(),
+            live: HashMap::new(),
+            quoting: HashSet::new(),
+            armed: HashMap::new(),
+            last_quote_poll: Instant::now() - Duration::from_secs(3600),
+            force_quote: true,
+            toasts: Vec::new(),
+            smtp: SmtpCfg::load(),
+            mark_cache: None,
         };
         app.fix_colors();
         let mut want: Vec<String> = app.st.compare.clone();
@@ -198,6 +250,9 @@ impl App {
                 self.fit_pending = true;
                 self.cdl_fit_pending = true;
                 self.confirm_del = None;
+                self.armed.clear();
+                self.mark_cache = None;
+                self.force_quote = true;
                 let mut want = self.st.compare.clone();
                 want.push(self.st.selected.clone());
                 for s in want {
@@ -210,6 +265,454 @@ impl App {
                 self.notify(msg, true);
             }
             Err(e) => self.notify(format!("匯入失敗:{e}"), false),
+        }
+    }
+
+    // ---------------------------------------------------------------- alerts
+
+    fn all_symbols(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in self.st.groups.iter().flat_map(|g| g.symbols.iter()).chain(self.st.compare.iter()).chain(std::iter::once(&self.st.selected)) {
+            if !s.is_empty() && !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+        out
+    }
+
+    fn last_price(&self, sym: &str) -> Option<f64> {
+        self.live.get(sym).map(|q| q.price).or_else(|| self.series.get(sym).and_then(|s| s.bars.last().map(|b| b.c)))
+    }
+
+    fn form_reset_params(&mut self) {
+        let hint = self.last_price(&self.form.sym).unwrap_or(100.0);
+        self.form.params = Cond::new(self.form.kind, self.form.up, hint).params;
+    }
+
+    fn next_alert_id(&self) -> u64 {
+        self.st.alerts.iter().map(|a| a.id).max().unwrap_or(0) + 1
+    }
+
+    fn add_alert(&mut self, a: Alert) {
+        let sym = a.symbol.clone();
+        self.st.alerts.push(a);
+        self.force_quote = true;
+        self.dirty = true;
+        self.mark_cache = None;
+        let _ = sym;
+    }
+
+    fn create_price_alert(&mut self, sym: &str, level: f64) {
+        let last = self.last_price(sym).unwrap_or(level);
+        let level = if level >= 1.0 { (level * 100.0).round() / 100.0 } else { (level * 1e4).round() / 1e4 };
+        let cond = Cond::new(CondKind::Price, level > last, level);
+        let msg = format!("已建立警示:{} {}", sym, cond.title());
+        let a = Alert { id: self.next_alert_id(), symbol: sym.to_string(), cond, ..Default::default() };
+        self.add_alert(a);
+        self.notify(msg, true);
+    }
+
+    fn alert_poll(&mut self, ctx: &egui::Context) {
+        let mut syms: Vec<String> = Vec::new();
+        for a in self.st.alerts.iter().filter(|a| a.enabled) {
+            if !syms.contains(&a.symbol) {
+                syms.push(a.symbol.clone());
+            }
+        }
+        if syms.is_empty() {
+            return;
+        }
+        let every = Duration::from_secs(60);
+        if self.force_quote || self.last_quote_poll.elapsed() >= every {
+            self.force_quote = false;
+            self.last_quote_poll = Instant::now();
+            for s in syms {
+                self.request(ctx, &s);
+                if self.quoting.insert(s.clone()) {
+                    let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                    std::thread::spawn(move || {
+                        let r = data::fetch_quote(&s);
+                        let _ = tx.send(Msg::Quote(s, r));
+                        ctx.request_repaint();
+                    });
+                }
+            }
+        }
+        ctx.request_repaint_after(every.saturating_sub(self.last_quote_poll.elapsed()) + Duration::from_millis(50));
+    }
+
+    fn eval_alerts(&mut self, ctx: &egui::Context, sym: &str) {
+        let (Some(ser), Some(q)) = (self.series.get(sym).cloned(), self.live.get(sym).copied()) else { return };
+        let bars = alert::merge_live(&ser.bars, &q);
+        let now = data::now_secs();
+        let mut to_fire = Vec::new();
+        for (i, a) in self.st.alerts.iter().enumerate() {
+            if !a.enabled || a.symbol != sym {
+                continue;
+            }
+            let met = a.cond.series(&bars).last().copied().unwrap_or(false);
+            let prev = self.armed.insert(a.id, met);
+            if alert::should_fire(a.repeat, met, prev, now, a.last_fired) {
+                to_fire.push(i);
+            }
+        }
+        for i in to_fire {
+            self.fire_alert(ctx, i, q.price, now);
+        }
+    }
+
+    fn fire_alert(&mut self, ctx: &egui::Context, idx: usize, price: f64, now: i64) {
+        let a = &mut self.st.alerts[idx];
+        a.last_fired = now;
+        a.fired += 1;
+        if a.repeat == Repeat::Once {
+            a.enabled = false;
+        }
+        let a = a.clone();
+        let name = self.display_name(&a.symbol);
+        let title = if name.is_empty() { format!("警示 · {}", a.symbol) } else { format!("警示 · {} {}", a.symbol, name) };
+        let body = format!("{}  現價 {}", a.cond.title(), fmt_price(price));
+        self.st.alert_log.push(AlertEvent { alert: a.id, symbol: a.symbol.clone(), t: now, price, text: body.clone(), bull: a.cond.up });
+        let n = self.st.alert_log.len();
+        if n > 500 {
+            self.st.alert_log.drain(..n - 500);
+        }
+        if a.toast {
+            self.toasts.push(Toast { title: title.clone(), body: body.clone(), at: Instant::now() });
+        }
+        if a.system {
+            system_notify(&title, &body);
+        }
+        if a.email {
+            if self.smtp.ready() {
+                let (cfg, tx, ctx) = (self.smtp.clone(), self.tx.clone(), ctx.clone());
+                let label = format!("{}", a.symbol);
+                let (subj, text) = (format!("[StockView] {title}"), format!("{body}\n\n{}", fmt_stamp(now)));
+                std::thread::spawn(move || {
+                    let r = mail::send(&cfg, &subj, &text);
+                    let _ = tx.send(Msg::Mail(label, r));
+                    ctx.request_repaint();
+                });
+            } else {
+                self.notify("警示郵件未寄出:尚未設定郵件伺服器(警示視窗 → 郵件設定)", false);
+            }
+        }
+        self.mark_cache = None;
+        self.dirty = true;
+        ctx.request_repaint();
+    }
+
+    /// Chart annotations for one symbol: historical signal points, fired alerts and live price levels.
+    fn alert_marks(&mut self, sym: &str) -> Arc<MarkSet> {
+        let key = format!(
+            "{sym}|{}|{:?}|{}|{}",
+            self.series.get(sym).map_or(0, |s| s.bars.len()),
+            self.live.get(sym).map(|q| q.price),
+            serde_json::to_string(&self.st.alerts).unwrap_or_default(),
+            self.st.alert_log.len()
+        );
+        if let Some((k, v)) = &self.mark_cache {
+            if *k == key {
+                return v.clone();
+            }
+        }
+        let mut marks = Vec::new();
+        let mut levels = Vec::new();
+        let rel: Vec<&Alert> = self.st.alerts.iter().filter(|a| a.symbol == sym && a.chart).collect();
+        if let Some(ser) = self.series.get(sym) {
+            let bars = match self.live.get(sym) {
+                Some(q) => alert::merge_live(&ser.bars, q),
+                None => ser.bars.clone(),
+            };
+            for a in &rel {
+                let edges = alert::rising_edges(&a.cond.series(&bars));
+                for &i in edges.iter().rev().take(400) {
+                    marks.push(candle::Mark { t: bars[i].t, price: f64::NAN, bull: a.cond.up, fired: false, text: a.cond.title() });
+                }
+                if a.enabled && a.cond.kind == CondKind::Price {
+                    levels.push(candle::Level { price: a.cond.params[0], text: fmt_price(a.cond.params[0]) });
+                }
+            }
+        }
+        for e in self.st.alert_log.iter().filter(|e| e.symbol == sym) {
+            if rel.iter().any(|a| a.id == e.alert) {
+                marks.push(candle::Mark { t: e.t, price: e.price, bull: e.bull, fired: true, text: format!("已觸發 · {}", e.text) });
+            }
+        }
+        let v = Arc::new((marks, levels));
+        self.mark_cache = Some((key, v.clone()));
+        v
+    }
+
+    fn draw_toasts(&mut self, ctx: &egui::Context) {
+        self.toasts.retain(|t| t.at.elapsed() < Duration::from_secs(15));
+        if self.toasts.is_empty() {
+            return;
+        }
+        let pal = self.pal.clone();
+        let mut dismiss: Option<usize> = None;
+        egui::Area::new(Id::new("alert_toasts")).order(egui::Order::Tooltip).anchor(Align2::RIGHT_BOTTOM, vec2(-280.0, -16.0)).show(ctx, |ui| {
+            for (i, t) in self.toasts.iter().enumerate() {
+                let fr = egui::Frame::popup(ui.style()).stroke(Stroke::new(1.5, pal.baseline)).show(ui, |ui| {
+                    ui.set_width(300.0);
+                    ui.label(egui::RichText::new(&t.title).size(13.5).color(pal.baseline));
+                    ui.label(egui::RichText::new(&t.body).size(13.0).color(pal.ink));
+                    ui.label(egui::RichText::new("點擊關閉").size(10.5).color(pal.dim));
+                });
+                if fr.response.interact(Sense::click()).clicked() {
+                    dismiss = Some(i);
+                }
+                ui.add_space(6.0);
+            }
+        });
+        if let Some(i) = dismiss {
+            self.toasts.remove(i);
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    fn alerts_window(&mut self, ctx: &egui::Context) {
+        if !self.alerts_open {
+            return;
+        }
+        let mut open = true;
+        let pal = self.pal.clone();
+        egui::Window::new("警示").open(&mut open).default_width(600.0).collapsible(false).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (i, l) in ["警示", "觸發紀錄", "郵件設定"].iter().enumerate() {
+                    if chip_btn(ui, &pal, l, self.alert_tab == i).clicked() {
+                        self.alert_tab = i;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            match self.alert_tab {
+                0 => self.alerts_tab(ui),
+                1 => self.log_tab(ui),
+                _ => self.mail_tab(ui),
+            }
+        });
+        self.alerts_open = open;
+    }
+
+    fn alerts_tab(&mut self, ui: &mut Ui) {
+        let pal = self.pal.clone();
+        if self.form.sym.is_empty() {
+            self.form.sym = self.st.selected.clone();
+            self.form_reset_params();
+        }
+        let syms = self.all_symbols();
+        let mut reset = false;
+        let mut add = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new("新增警示").size(12.0).color(pal.dim));
+            egui::Grid::new("alert_form").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("股票");
+                egui::ComboBox::from_id_salt("al_sym").selected_text(self.form.sym.clone()).show_ui(ui, |ui| {
+                    for s in &syms {
+                        reset |= ui.selectable_value(&mut self.form.sym, s.clone(), s).changed();
+                    }
+                });
+                ui.end_row();
+                ui.label("條件");
+                ui.horizontal_wrapped(|ui| {
+                    let kind = self.form.kind;
+                    egui::ComboBox::from_id_salt("al_kind").selected_text(kind.label()).show_ui(ui, |ui| {
+                        for k in CondKind::ALL {
+                            reset |= ui.selectable_value(&mut self.form.kind, k, k.label()).changed();
+                        }
+                    });
+                    if let Some((u, d)) = self.form.kind.dirs() {
+                        let before = self.form.up;
+                        egui::ComboBox::from_id_salt("al_dir").selected_text(if self.form.up { u } else { d }).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.form.up, true, u);
+                            ui.selectable_value(&mut self.form.up, false, d);
+                        });
+                        if before != self.form.up && self.form.kind == CondKind::RsiCross {
+                            reset = true;
+                        }
+                    }
+                    if self.form.params.len() != self.form.kind.params().len() {
+                        reset = true;
+                    }
+                    for (k, spec) in self.form.kind.params().iter().enumerate() {
+                        if k >= self.form.params.len() {
+                            break;
+                        }
+                        ui.label(egui::RichText::new(spec.name).size(11.5).color(pal.dim));
+                        let v = &mut self.form.params[k];
+                        let speed = if spec.int { 0.15 } else { (v.abs() * 0.004).max(0.01) };
+                        ui.add(egui::DragValue::new(v).range(spec.min..=spec.max).speed(speed).max_decimals(if spec.int { 0 } else { 4 }));
+                    }
+                });
+                ui.end_row();
+                ui.label("頻率");
+                ui.horizontal(|ui| {
+                    for r in [Repeat::Once, Repeat::EveryMinute] {
+                        ui.radio_value(&mut self.form.repeat, r, r.label());
+                    }
+                });
+                ui.end_row();
+                ui.label("通知");
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.form.toast, "畫面提示");
+                    ui.checkbox(&mut self.form.system, "系統通知");
+                    ui.checkbox(&mut self.form.email, "Email");
+                    ui.checkbox(&mut self.form.chart, "圖上標記");
+                });
+                ui.end_row();
+            });
+            if chip_btn(ui, &pal, "新增警示", true).clicked() {
+                add = true;
+            }
+        });
+        if reset {
+            self.form_reset_params();
+        }
+        if add && !self.form.sym.is_empty() {
+            let mut cond = Cond { kind: self.form.kind, up: self.form.up, params: self.form.params.clone() };
+            cond.sanitize();
+            let f = &self.form;
+            let a = Alert {
+                id: self.next_alert_id(),
+                symbol: f.sym.clone(),
+                cond,
+                repeat: f.repeat,
+                toast: f.toast,
+                system: f.system,
+                email: f.email,
+                chart: f.chart,
+                ..Default::default()
+            };
+            let ctx = ui.ctx().clone();
+            self.request(&ctx, &a.symbol.clone());
+            self.add_alert(a);
+        }
+        ui.add_space(8.0);
+        let mut remove: Option<usize> = None;
+        let mut rearm: Vec<u64> = Vec::new();
+        let mut changed = false;
+        if self.st.alerts.is_empty() {
+            ui.colored_label(pal.dim, "尚無警示。也可在 K 線模式用左側鈴鐺工具,直接點圖上的價位建立。");
+        }
+        egui::ScrollArea::vertical().max_height(280.0).auto_shrink([true, true]).show(ui, |ui| {
+            for (i, a) in self.st.alerts.iter_mut().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.checkbox(&mut a.enabled, "").changed() {
+                        changed = true;
+                        rearm.push(a.id);
+                    }
+                    ui.label(egui::RichText::new(&a.symbol).size(13.0).color(pal.ink));
+                    ui.label(egui::RichText::new(a.cond.title()).size(13.0).color(pal.ink));
+                    let mut ch: Vec<&str> = Vec::new();
+                    if a.toast { ch.push("提示"); }
+                    if a.system { ch.push("系統"); }
+                    if a.email { ch.push("Email"); }
+                    let status = if a.enabled {
+                        "監控中".to_string()
+                    } else if a.fired > 0 && a.repeat == Repeat::Once {
+                        "已觸發".to_string()
+                    } else {
+                        "已暫停".to_string()
+                    };
+                    let fired = if a.fired > 0 { format!(" · 觸發 {} 次", a.fired) } else { String::new() };
+                    ui.label(egui::RichText::new(format!("{} · {} · {}{}", a.repeat.label(), ch.join("/"), status, fired)).size(11.5).color(pal.dim));
+                    if ui.small_button("×").on_hover_text("刪除").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+        });
+        for id in rearm {
+            self.armed.remove(&id);
+            self.force_quote = true;
+        }
+        if let Some(i) = remove {
+            let id = self.st.alerts.remove(i).id;
+            self.armed.remove(&id);
+            changed = true;
+        }
+        if changed {
+            self.mark_cache = None;
+            self.dirty = true;
+        }
+    }
+
+    fn log_tab(&mut self, ui: &mut Ui) {
+        let pal = self.pal.clone();
+        if self.st.alert_log.is_empty() {
+            ui.colored_label(pal.dim, "還沒有觸發過的警示");
+            return;
+        }
+        if chip_btn(ui, &pal, "清除紀錄", false).clicked() {
+            self.st.alert_log.clear();
+            self.mark_cache = None;
+            self.dirty = true;
+            return;
+        }
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().max_height(380.0).auto_shrink([true, true]).show(ui, |ui| {
+            for e in self.st.alert_log.iter().rev() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(fmt_stamp(e.t)).size(11.5).color(pal.dim));
+                    ui.label(egui::RichText::new(&e.symbol).size(13.0).color(pal.ink));
+                    ui.label(egui::RichText::new(&e.text).size(12.5).color(pal.ink));
+                });
+            }
+        });
+    }
+
+    fn mail_tab(&mut self, ui: &mut Ui) {
+        let pal = self.pal.clone();
+        let c = &mut self.smtp;
+        egui::Grid::new("smtp").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label("SMTP 伺服器");
+            ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("smtp.gmail.com").desired_width(260.0));
+            ui.end_row();
+            ui.label("連接埠");
+            let mut port = c.port as u32;
+            ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+            c.port = port as u16;
+            ui.end_row();
+            ui.label("帳號");
+            ui.add(egui::TextEdit::singleline(&mut c.user).desired_width(260.0));
+            ui.end_row();
+            ui.label("密碼");
+            ui.add(egui::TextEdit::singleline(&mut c.pass).password(true).desired_width(260.0));
+            ui.end_row();
+            ui.label("寄件人");
+            ui.add(egui::TextEdit::singleline(&mut c.from).hint_text("留空則使用帳號").desired_width(260.0));
+            ui.end_row();
+            ui.label("收件人");
+            ui.add(egui::TextEdit::singleline(&mut c.to).hint_text("多個以逗號分隔").desired_width(260.0));
+            ui.end_row();
+        });
+        ui.label(
+            egui::RichText::new("埠 465 使用 SSL,其他(如 587)使用 STARTTLS。Gmail 需使用「應用程式密碼」。\n密碼只存在本機的 smtp.json,不會包含在匯出的設定檔裡。")
+                .size(11.0)
+                .color(pal.dim),
+        );
+        ui.add_space(4.0);
+        let (mut save, mut test) = (false, false);
+        ui.horizontal(|ui| {
+            save = chip_btn(ui, &pal, "儲存", true).clicked();
+            test = chip_btn(ui, &pal, "寄送測試信", false).clicked();
+        });
+        if save {
+            match self.smtp.save() {
+                Ok(()) => self.notify("郵件設定已儲存", true),
+                Err(e) => self.notify(format!("儲存失敗:{e}"), false),
+            }
+        }
+        if test {
+            let (cfg, tx, ctx) = (self.smtp.clone(), self.tx.clone(), ui.ctx().clone());
+            std::thread::spawn(move || {
+                let r = mail::send(&cfg, "[StockView] 測試信", "這是一封來自 StockView 的測試郵件。收到代表警示郵件設定正確。");
+                let _ = tx.send(Msg::Mail("測試信".into(), r));
+                ctx.request_repaint();
+            });
+            self.notify("測試信寄送中…", true);
         }
     }
 
@@ -262,6 +765,7 @@ impl App {
                         Ok(s) => {
                             self.series.insert(sym.clone(), Arc::new(s));
                             self.bars_cache = None;
+                            self.eval_alerts(ctx, &sym);
                             if sym == self.st.selected {
                                 self.cdl_fit_pending = self.cdl_fit_pending || false;
                             }
@@ -280,6 +784,17 @@ impl App {
                         }
                     }
                 }
+                Msg::Quote(sym, r) => {
+                    self.quoting.remove(&sym);
+                    if let Ok(q) = r {
+                        self.live.insert(sym.clone(), q);
+                        self.eval_alerts(ctx, &sym);
+                    }
+                }
+                Msg::Mail(label, r) => match r {
+                    Ok(()) => self.notify(format!("{label}:郵件已寄出"), true),
+                    Err(e) => self.notify(format!("{label}:{e}"), false),
+                },
                 Msg::Hits(q, r) => {
                     if q != self.query.trim() {
                         continue;
@@ -527,6 +1042,22 @@ impl App {
                 }
                 _ => {}
             }
+            if std::env::var("STOCKVIEW_ALERTS").is_ok() {
+                let sym = self.st.selected.clone();
+                let last = self.last_price(&sym).unwrap_or(100.0);
+                let mk = |id: u64, cond: Cond| Alert { id, symbol: sym.clone(), cond, ..Default::default() };
+                self.st.alerts = vec![
+                    mk(1, Cond::new(CondKind::Price, true, last * 1.04)),
+                    mk(2, Cond::new(CondKind::Price, false, last * 0.93)),
+                    mk(3, Cond::new(CondKind::MaCross, true, 0.0)),
+                    Alert { repeat: Repeat::EveryMinute, email: true, ..mk(4, Cond::new(CondKind::KdCross, false, 0.0)) },
+                ];
+                self.st.alert_log = vec![AlertEvent { alert: 1, symbol: sym.clone(), t: data::now_secs() - 86_400 * 9, price: last * 0.97, text: "價格向上觸及 示範  現價".into(), bull: true }];
+                self.toasts.push(Toast { title: format!("警示 · {sym}"), body: "價格向上觸及 115  現價 115.2".into(), at: Instant::now() });
+                self.alerts_open = std::env::var("STOCKVIEW_ALERTS").as_deref() == Ok("window");
+                self.force_quote = false;
+                self.last_quote_poll = Instant::now();
+            }
             if let Ok(r) = std::env::var("STOCKVIEW_RANGE") {
                 if let Some(r) = Range::ALL.iter().copied().find(|x| x.label() == r) {
                     self.set_range(ctx, r);
@@ -642,6 +1173,11 @@ impl App {
                     self.dirty = true;
                 }
                 self.settings_menu(ui);
+                let n = self.st.alerts.iter().filter(|a| a.enabled).count();
+                let label = if n > 0 { format!("警示 {n}") } else { "警示".to_string() };
+                if chip_btn(ui, &self.pal, &label, self.alerts_open).on_hover_text("價格 / 指標警示").clicked() {
+                    self.alerts_open = !self.alerts_open;
+                }
             });
         });
         ui.add_space(6.0);
@@ -1388,6 +1924,7 @@ impl App {
             (Tool::Trend, 1, "趨勢線"),
             (Tool::HLine, 2, "水平線"),
             (Tool::Fib, 3, "斐波那契回檔"),
+            (Tool::Alert, 6, "價格警示:點擊圖上價位建立"),
         ];
         ui.vertical_centered(|ui| {
             for (t, icon, tip) in tools {
@@ -1439,6 +1976,7 @@ impl App {
                         Interval::W => "週",
                         Interval::M => "月",
                     };
+                    let mk = self.alert_marks(&sym);
                     let prm = candle::Params {
                         pal: &self.pal,
                         bars: &bars,
@@ -1447,6 +1985,8 @@ impl App {
                         ind: &self.st.indicators,
                         log: self.st.log_scale,
                         tool: self.tool,
+                        marks: &mk.0,
+                        levels: &mk.1,
                     };
                     let mut v = self.cdl_view;
                     let mut dr = self.st.drawings.remove(&sym).unwrap_or_default();
@@ -1461,6 +2001,10 @@ impl App {
                     self.cdl_view = v;
                     if done {
                         self.tool = Tool::Cursor;
+                    }
+                    if let Some(level) = self.ts.new_alert.take() {
+                        let sym = self.st.selected.clone();
+                        self.create_price_alert(&sym, level);
                     }
                 } else {
                     let rect = ui.available_rect_before_wrap();
@@ -1485,6 +2029,7 @@ impl eframe::App for App {
         let ctx = &ctx;
         self.poll(ctx);
         self.debug_shot(ctx);
+        self.alert_poll(ctx);
         if !self.loading.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
@@ -1525,6 +2070,8 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(pal.ground))
             .show(root, |ui| self.central(ui));
 
+        self.alerts_window(ctx);
+        self.draw_toasts(ctx);
         if let Some((msg, ok, at)) = &self.notice {
             if at.elapsed() < Duration::from_secs(5) {
                 let col = if *ok { pal.ink } else { pal.baseline };
@@ -1627,6 +2174,12 @@ fn tool_btn(ui: &mut Ui, pal: &Palette, icon: u8, active: bool, tip: &str) -> Re
             p.line_segment([c + vec2(-7.0, -2.0), c + vec2(-3.0, -6.0)], s);
             p.line_segment([c + vec2(-7.0, -2.0), c + vec2(-3.0, 2.0)], s);
         }
+        6 => {
+            // bell
+            let pts = vec![c + vec2(-7.0, 4.0), c + vec2(-5.0, 3.0), c + vec2(-4.5, -3.0), c + vec2(-2.0, -7.0), c + vec2(2.0, -7.0), c + vec2(4.5, -3.0), c + vec2(5.0, 3.0), c + vec2(7.0, 4.0)];
+            p.add(egui::Shape::closed_line(pts, s));
+            p.circle_filled(c + vec2(0.0, 8.0), 2.0, fg);
+        }
         _ => {
             // trash can
             p.line_segment([c + vec2(-7.0, -5.0), c + vec2(7.0, -5.0)], s);
@@ -1638,3 +2191,21 @@ fn tool_btn(ui: &mut Ui, pal: &Palette, icon: u8, active: bool, tip: &str) -> Re
     }
     resp.on_hover_text(tip)
 }
+
+fn fmt_stamp(t: i64) -> String {
+    chrono::DateTime::from_timestamp(t, 0)
+        .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn system_notify(title: &str, body: &str) {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title));
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("osascript").args(["-e", &script]).output();
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_notify(_title: &str, _body: &str) {}

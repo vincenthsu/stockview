@@ -20,10 +20,26 @@ pub enum Tool {
     Trend,
     HLine,
     Fib,
+    Alert,
+}
+
+/// A point worth flagging on the chart: a historical signal or an alert that actually fired.
+pub struct Mark {
+    pub t: i64,
+    pub price: f64,
+    pub bull: bool,
+    pub fired: bool,
+    pub text: String,
+}
+
+pub struct Level {
+    pub price: f64,
+    pub text: String,
 }
 
 #[derive(Default)]
 pub struct ToolState {
+    pub new_alert: Option<f64>,
     pub pending: Option<(i64, f64)>,
     pub selected: Option<usize>,
 }
@@ -36,6 +52,8 @@ pub struct Params<'a> {
     pub ind: &'a Indicators,
     pub log: bool,
     pub tool: Tool,
+    pub marks: &'a [Mark],
+    pub levels: &'a [Level],
 }
 
 pub fn idx_of_t(bars: &[Bar], t: i64) -> f64 {
@@ -438,6 +456,53 @@ pub fn show(
         hit_cache.push((di, segs));
     }
 
+    // --- alert levels & markers ---
+    for lv in prm.levels {
+        let yy = y_of(lv.price);
+        if yy < main.top() || yy > main.bottom() {
+            continue;
+        }
+        pm.extend(Shape::dashed_line(&[pos2(main.left(), yy), pos2(main.right(), yy)], Stroke::new(1.2, pal.baseline), 5.0, 3.0));
+        let g = p.layout_no_wrap(format!("警示 {}", lv.text), fp(10.5), pal.baseline);
+        let r = Rect::from_min_size(pos2(main.left() + 8.0, yy - g.size().y - 2.0), g.size());
+        pm.galley(r.min, g, pal.baseline);
+    }
+    let mut mark_tip: Option<(Pos2, String)> = None;
+    let mouse = ui.input(|i| i.pointer.hover_pos());
+    for m in prm.marks {
+        let bi = bars.partition_point(|b| b.t <= m.t).saturating_sub(1).min(n - 1);
+        if bi < i0 || bi >= i1 {
+            continue;
+        }
+        let x = x_of(bi as f64);
+        let b = &bars[bi];
+        let col = if m.bull { pal.up } else { pal.down };
+        let at;
+        if m.fired {
+            let yy = y_of(if m.price.is_finite() { m.price } else { b.c });
+            at = pos2(x, yy);
+            let d = 6.5;
+            let pts = vec![at + vec2(0.0, -d), at + vec2(d, 0.0), at + vec2(0.0, d), at + vec2(-d, 0.0)];
+            pm.add(Shape::convex_polygon(pts, pal.baseline, Stroke::new(1.5, pal.ground)));
+        } else {
+            let (tip, dir) = if m.bull { (pos2(x, y_of(b.l) + 5.0), 1.0) } else { (pos2(x, y_of(b.h) - 5.0), -1.0) };
+            at = tip + vec2(0.0, dir * 4.0);
+            let pts = vec![tip, tip + vec2(-4.5, dir * 8.0), tip + vec2(4.5, dir * 8.0)];
+            pm.add(Shape::convex_polygon(pts, col.gamma_multiply(0.85), Stroke::new(1.0, pal.ground)));
+        }
+        if mouse.map_or(false, |mp| mp.distance(at) < 10.0) && main.contains(mouse.unwrap()) {
+            mark_tip = Some((at, format!("{}  {}", fmt_date(m.t), m.text)));
+        }
+    }
+    if let Some((at, txt)) = mark_tip {
+        let g = p.layout_no_wrap(txt, fp(11.5), pal.on_ink);
+        let sz = g.size() + vec2(14.0, 8.0);
+        let x = (at.x - sz.x / 2.0).clamp(main.left() + 2.0, (main.right() - sz.x - 2.0).max(main.left()));
+        let r = Rect::from_min_size(pos2(x, (at.y - sz.y - 12.0).max(main.top() + 2.0)), sz);
+        p.rect_filled(r, 2.0, pal.ink);
+        p.galley(r.min + vec2(7.0, 4.0), g, pal.on_ink);
+    }
+
     // --- price axis labels ---
     let mut occupied: Vec<Rect> = Vec::new();
     let lr = Rect::from_center_size(pos2(main.right() + GUTTER / 2.0 - 4.0, ly), vec2(GUTTER - 10.0, 18.0));
@@ -526,6 +591,10 @@ pub fn show(
                         })
                         .min_by(|a, b| a.1.total_cmp(&b.1))
                         .map(|x| x.0);
+                }
+                Tool::Alert => {
+                    ts.new_alert = Some(pr);
+                    new_tool_done = true;
                 }
                 Tool::HLine => {
                     drawings.push(Drawing::HLine { p: pr });
