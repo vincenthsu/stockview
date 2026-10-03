@@ -6,6 +6,8 @@ mod calc;
 mod candle;
 mod compare;
 mod data;
+mod fundamental_ui;
+mod fundamentals;
 mod indicator;
 mod mail;
 mod store;

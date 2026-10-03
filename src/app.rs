@@ -109,6 +109,7 @@ pub struct App {
     smtp: SmtpCfg,
     mark_cache: Option<(String, Arc<MarkSet>)>,
     bt: BtState,
+    fundamentals: crate::fundamental_ui::State,
 }
 
 const MAX_COMPARE: usize = 8;
@@ -193,6 +194,7 @@ impl App {
             smtp: SmtpCfg::load(),
             mark_cache: None,
             bt: BtState::default(),
+            fundamentals: crate::fundamental_ui::State::default(),
         };
         app.fix_colors();
         let mut want: Vec<String> = app.st.compare.clone();
@@ -1150,6 +1152,12 @@ impl App {
         let Ok(path) = std::env::var("STOCKVIEW_SHOT") else { return };
         let frame = ctx.cumulative_pass_nr();
         if frame == 1 {
+            if std::env::var("STOCKVIEW_FUNDAMENTALS").is_ok() {
+                self.fundamentals.open_detail(&self.st.selected);
+            }
+            if let Ok(input) = std::env::var("STOCKVIEW_SCREENER") {
+                self.fundamentals.open_screen_with(&input);
+            }
             match std::env::var("STOCKVIEW_MODE").as_deref() {
                 Ok("chart") => {
                     self.st.mode = Mode::Chart;
@@ -1195,7 +1203,7 @@ impl App {
                 self.apply_theme(ctx);
             }
         }
-        let ready = self.loading.is_empty() && !self.fit_pending;
+        let ready = self.loading.is_empty() && !self.fit_pending && !self.fundamentals.busy();
         ctx.request_repaint_after(Duration::from_millis(100));
         if ready && self.shot_at.is_none() {
             self.shot_at = Some(frame + 8);
@@ -1300,6 +1308,12 @@ impl App {
                     self.dirty = true;
                 }
                 self.settings_menu(ui);
+                if chip_btn(ui, &self.pal, "基本面", self.fundamentals.detail_open).clicked() {
+                    self.fundamentals.open_detail(&self.st.selected);
+                }
+                if chip_btn(ui, &self.pal, "選股", self.fundamentals.screen_open).clicked() {
+                    self.fundamentals.open_screen(&self.all_symbols());
+                }
                 if chip_btn(ui, &self.pal, "回測", self.bt.open).on_hover_text("交易策略回測(KD / RSI / 均線)").clicked() {
                     self.bt.open = !self.bt.open;
                 }
@@ -1823,6 +1837,10 @@ impl App {
                     open = Some(sym.clone());
                 }
                 resp.context_menu(|ui| {
+                    if ui.button("個股基本面").clicked() {
+                        self.fundamentals.open_detail(&sym);
+                        ui.close();
+                    }
                     if ui.button("以 K 線檢視").clicked() {
                         open = Some(sym.clone());
                         ui.close();
@@ -2158,6 +2176,7 @@ impl eframe::App for App {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
         self.poll(ctx);
+        self.fundamentals.poll(ctx);
         self.debug_shot(ctx);
         self.alert_poll(ctx);
         if !self.loading.is_empty() {
@@ -2202,6 +2221,25 @@ impl eframe::App for App {
 
         self.alerts_window(ctx);
         self.backtest_window(ctx);
+        match self.fundamentals.windows(ctx, &self.all_symbols()) {
+            Some(crate::fundamental_ui::Action::Chart(sym)) => {
+                self.st.selected = sym.clone();
+                self.st.mode = Mode::Chart;
+                self.cdl_fit_pending = true;
+                self.ts = ToolState::default();
+                self.request(ctx, &sym);
+                self.dirty = true;
+            }
+            Some(crate::fundamental_ui::Action::Add(sym)) => {
+                if !self.st.watch().contains(&sym) {
+                    self.st.watch_mut().push(sym.clone());
+                    self.request(ctx, &sym);
+                    self.dirty = true;
+                    self.notify(format!("已加入自選:{sym}"), true);
+                }
+            }
+            None => {}
+        }
         self.draw_toasts(ctx);
         if let Some((msg, ok, at)) = &self.notice {
             if at.elapsed() < Duration::from_secs(5) {
