@@ -1,6 +1,7 @@
 mod alert;
 mod app;
 mod axis;
+mod backtest;
 mod calc;
 mod candle;
 mod compare;

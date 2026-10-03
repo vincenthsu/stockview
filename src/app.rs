@@ -2,6 +2,7 @@
 
 use crate::alert::{self, Alert, AlertEvent, Cond, CondKind, Quote, Repeat};
 use crate::axis::*;
+use crate::backtest::{self, Strat};
 use crate::calc::{self, Resample, DAY};
 use crate::candle::{self, Tool, ToolState};
 use crate::compare::{self, Line};
@@ -20,6 +21,21 @@ enum Msg {
     Hits(String, Result<Vec<SearchHit>, String>),
     Quote(String, Result<Quote, String>),
     Mail(String, Result<(), String>),
+}
+
+struct BtState {
+    open: bool,
+    strat: Strat,
+    params: Vec<f64>,
+    years: f64,
+    /// Per-side cost in percent.
+    cost: f64,
+}
+
+impl Default for BtState {
+    fn default() -> Self {
+        Self { open: false, strat: Strat::Kd, params: Strat::Kd.params().iter().map(|p| p.def).collect(), years: 10.0, cost: 0.0 }
+    }
 }
 
 struct Toast {
@@ -92,6 +108,7 @@ pub struct App {
     toasts: Vec<Toast>,
     smtp: SmtpCfg,
     mark_cache: Option<(String, Arc<MarkSet>)>,
+    bt: BtState,
 }
 
 const MAX_COMPARE: usize = 8;
@@ -175,6 +192,7 @@ impl App {
             toasts: Vec::new(),
             smtp: SmtpCfg::load(),
             mark_cache: None,
+            bt: BtState::default(),
         };
         app.fix_colors();
         let mut want: Vec<String> = app.st.compare.clone();
@@ -493,6 +511,115 @@ impl App {
             }
         });
         self.alerts_open = open;
+    }
+
+    fn backtest_window(&mut self, ctx: &egui::Context) {
+        if !self.bt.open {
+            return;
+        }
+        let mut open = true;
+        let pal = self.pal.clone();
+        let sym = self.st.selected.clone();
+        let name = self.display_name(&sym);
+        let series = self.series.get(&sym).cloned();
+        let tr = self.st.total_return;
+        let bt = &mut self.bt;
+        egui::Window::new("策略回測").open(&mut open).default_width(560.0).collapsible(false).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for s in Strat::ALL {
+                    if chip_btn(ui, &pal, s.label(), bt.strat == s).clicked() && bt.strat != s {
+                        bt.strat = s;
+                        bt.params = s.params().iter().map(|p| p.def).collect();
+                    }
+                }
+            });
+            ui.label(egui::RichText::new(bt.strat.rule()).color(pal.dim).small());
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for (v, p) in bt.params.iter_mut().zip(bt.strat.params()) {
+                    ui.label(p.name);
+                    ui.add(egui::DragValue::new(v).range(p.min..=p.max).max_decimals(0));
+                }
+                ui.label("單邊成本 %");
+                ui.add(egui::DragValue::new(&mut bt.cost).range(0.0..=5.0).speed(0.01).max_decimals(3));
+            });
+            ui.horizontal(|ui| {
+                ui.label("期間");
+                for (y, l) in [(1.0, "1年"), (3.0, "3年"), (5.0, "5年"), (10.0, "10年"), (20.0, "20年"), (200.0, "全部")] {
+                    if chip_btn(ui, &pal, l, bt.years == y).clicked() {
+                        bt.years = y;
+                    }
+                }
+            });
+            ui.separator();
+            let Some(s) = series else {
+                ui.label(format!("{sym} 資料載入中…"));
+                return;
+            };
+            let Some(r) = backtest::run(bt.strat, &bt.params, &s.bars, bt.years, bt.cost / 100.0, tr) else {
+                ui.label("資料不足");
+                return;
+            };
+            let tint = |v: f64| if v >= 0.0 { pal.up } else { pal.down };
+            ui.label(format!(
+                "{name}({sym}) {} ~ {},約 {:.1} 年,{}",
+                fmt_date(r.equity[0].0),
+                fmt_date(r.equity[r.equity.len() - 1].0),
+                r.years,
+                if tr { "含息" } else { "純價格" }
+            ));
+            ui.add_space(2.0);
+            egui::Grid::new("bt_stats").num_columns(4).spacing([18.0, 4.0]).show(ui, |ui| {
+                let pct = |ui: &mut Ui, l: &str, v: f64| {
+                    ui.label(egui::RichText::new(l).color(pal.dim));
+                    let (txt, col) = if v.is_nan() { ("—".to_string(), pal.dim) } else { (fmt_pct(v), tint(v)) };
+                    ui.label(egui::RichText::new(txt).color(col).strong());
+                };
+                pct(ui, "策略總報酬", r.total);
+                pct(ui, "年化", r.cagr);
+                ui.end_row();
+                pct(ui, "買進持有", r.bh_total);
+                pct(ui, "年化", r.bh_cagr);
+                ui.end_row();
+                pct(ui, "最大回撤", r.max_dd);
+                ui.label(egui::RichText::new("交易 / 勝率").color(pal.dim));
+                ui.label(format!("{} 次 / {}", r.trades.len(), if r.win_rate.is_nan() { "—".into() } else { fmt_pct_plain(r.win_rate) }));
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 110.0), Sense::hover());
+            ui.painter().rect_filled(rect, 2.0, pal.ground);
+            let (lo, hi) = r.equity.iter().fold((1.0f64, 1.0f64), |(a, b), &(_, e)| (a.min(e), b.max(e)));
+            let (t0, t1) = (r.equity[0].0 as f64, r.equity[r.equity.len() - 1].0 as f64);
+            let at = |t: i64, e: f64| {
+                pos2(
+                    rect.left() + ((t as f64 - t0) / (t1 - t0).max(1.0)) as f32 * rect.width(),
+                    rect.bottom() - 4.0 - ((e - lo) / (hi - lo).max(1e-9)) as f32 * (rect.height() - 8.0),
+                )
+            };
+            ui.painter().line_segment([at(r.equity[0].0, 1.0), at(r.equity[r.equity.len() - 1].0, 1.0)], Stroke::new(1.0, pal.grid_major));
+            let step = (r.equity.len() / 600).max(1);
+            let pts: Vec<egui::Pos2> = r.equity.iter().step_by(step).map(|&(t, e)| at(t, e)).collect();
+            ui.painter().add(egui::Shape::line(pts, Stroke::new(1.5, pal.ink)));
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                egui::Grid::new("bt_trades").striped(true).num_columns(5).spacing([14.0, 3.0]).show(ui, |ui| {
+                    for h in ["買進", "賣出", "買價", "賣價", "報酬"] {
+                        ui.label(egui::RichText::new(h).color(pal.dim));
+                    }
+                    ui.end_row();
+                    for t in r.trades.iter().rev() {
+                        ui.label(fmt_date(t.entry_t));
+                        ui.label(if t.open { "持有中".to_string() } else { fmt_date(t.exit_t) });
+                        ui.label(fmt_price(t.entry));
+                        ui.label(fmt_price(t.exit));
+                        ui.label(egui::RichText::new(fmt_pct(t.ret)).color(tint(t.ret)));
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        self.bt.open = open;
     }
 
     fn alerts_tab(&mut self, ui: &mut Ui) {
@@ -1173,6 +1300,9 @@ impl App {
                     self.dirty = true;
                 }
                 self.settings_menu(ui);
+                if chip_btn(ui, &self.pal, "回測", self.bt.open).on_hover_text("交易策略回測(KD / RSI / 均線)").clicked() {
+                    self.bt.open = !self.bt.open;
+                }
                 let n = self.st.alerts.iter().filter(|a| a.enabled).count();
                 let label = if n > 0 { format!("警示 {n}") } else { "警示".to_string() };
                 if chip_btn(ui, &self.pal, &label, self.alerts_open).on_hover_text("價格 / 指標警示").clicked() {
@@ -2071,6 +2201,7 @@ impl eframe::App for App {
             .show(root, |ui| self.central(ui));
 
         self.alerts_window(ctx);
+        self.backtest_window(ctx);
         self.draw_toasts(ctx);
         if let Some((msg, ok, at)) = &self.notice {
             if at.elapsed() < Duration::from_secs(5) {
